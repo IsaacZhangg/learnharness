@@ -1,4 +1,4 @@
-# Throwaway reproduction for amosblomqvist/learnharness#277. Fork-only; not for upstream.
+# Throwaway reproduction and fix check for amosblomqvist/learnharness#277. Fork-only; not for upstream.
 name: repro-277-deb-sandbox
 on:
   push:
@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
-      DEB: LearnHarness-0.7.0-amd64.deb
+      DEB: built.deb
       SANDBOX: /opt/LearnHarness/chrome-sandbox
     steps:
       - name: Environment
@@ -30,15 +30,30 @@ jobs:
           probe sudo unshare --user true
           probe sudo unshare --user --map-root-user true
 
-      - name: Download the 0.7.0 deb and install its dependencies only
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+          cache: npm
+      - name: Build the .deb from this branch
         run: |
-          gh release download v0.7.0 --repo amosblomqvist/learnharness --pattern "$DEB"
+          npm ci
+          npm run plugins:setup
+          npm run build
+          node scripts/build-server.mjs
+          npx electron-builder --linux deb --x64 --publish never
+          ls dist/*.deb
+
+      - name: Inspect the built deb and install its dependencies only
+        run: |
+          cp dist/*.deb "$DEB"
           sha256sum "$DEB"
           dpkg-deb -f "$DEB" Package Version Depends
           dpkg-deb -c "$DEB" | grep chrome-sandbox
           dpkg-deb -e "$DEB" ctl
-          echo "--- shipped postinst namespace probe:"
-          grep -n -A5 'unshare' ctl/postinst
+          echo "--- built postinst sandbox lines:"
+          grep -n -B4 -A1 'chrome-sandbox' ctl/postinst
+          if grep -q unshare ctl/postinst; then echo "::error::postinst still has the namespace check"; exit 1; fi
           deps=$(dpkg-deb -f "$DEB" Depends | tr ',' '\n' | sed -E 's/\|.*//; s/\(.*\)//; s/[[:space:]]//g' | grep -v '^$')
           sudo apt-get update -qq
           sudo apt-get install -y -qq xvfb $deps
@@ -77,14 +92,3 @@ jobs:
           sudo apparmor_parser -R /etc/apparmor.d/learnharness
           launch C-profile-unloaded
 
-      - name: "D: profile not loaded, chrome-sandbox 4755 (suggested fix 2)"
-        run: |
-          source "$RUNNER_TEMP/launch.sh"
-          sudo chmod 4755 "$SANDBOX"
-          launch D-profile-unloaded-4755
-
-      - name: "E: profile loaded again, chrome-sandbox 4755"
-        run: |
-          source "$RUNNER_TEMP/launch.sh"
-          sudo apparmor_parser -r /etc/apparmor.d/learnharness
-          launch E-profile-loaded-4755
