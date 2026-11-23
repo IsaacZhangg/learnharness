@@ -1,0 +1,90 @@
+# Throwaway reproduction for amosblomqvist/learnharness#277. Fork-only; not for upstream.
+name: repro-277-deb-sandbox
+on:
+  push:
+    branches: [repro/277-deb-sandbox]
+permissions:
+  contents: read
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DEB: LearnHarness-0.7.0-amd64.deb
+      SANDBOX: /opt/LearnHarness/chrome-sandbox
+    steps:
+      - name: Environment
+        run: |
+          uname -a
+          grep PRETTY_NAME /etc/os-release
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          if sudo aa-status --enabled; then echo "AppArmor enabled"; else echo "AppArmor NOT enabled"; fi
+          id
+
+      - name: Namespace probes, desktop user vs root
+        run: |
+          probe() { if "$@" >/dev/null 2>&1; then r=0; else r=$?; fi; echo "exit $r <- $*"; }
+          probe unshare --user true
+          probe unshare --user --map-root-user true
+          probe sudo unshare --user true
+          probe sudo unshare --user --map-root-user true
+
+      - name: Download the 0.7.0 deb and install its dependencies only
+        run: |
+          gh release download v0.7.0 --repo amosblomqvist/learnharness --pattern "$DEB"
+          sha256sum "$DEB"
+          dpkg-deb -f "$DEB" Package Version Depends
+          dpkg-deb -c "$DEB" | grep chrome-sandbox
+          dpkg-deb -e "$DEB" ctl
+          echo "--- shipped postinst namespace probe:"
+          grep -n -A5 'unshare' ctl/postinst
+          deps=$(dpkg-deb -f "$DEB" Depends | tr ',' '\n' | sed -E 's/\|.*//; s/\(.*\)//; s/[[:space:]]//g' | grep -v '^$')
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb $deps
+          cat > "$RUNNER_TEMP/launch.sh" <<'SH'
+          launch() {
+            label=$1; log="$RUNNER_TEMP/$label.log"
+            echo "chrome-sandbox: $(stat -c '%a %U:%G' "$SANDBOX")"
+            echo "learnharness AppArmor profile loaded: $(sudo grep -c '^learnharness ' /sys/kernel/security/apparmor/profiles || true)"
+            set +e
+            XDG_CONFIG_HOME="$RUNNER_TEMP/cfg-$label" timeout -k 5 30 xvfb-run -a /opt/LearnHarness/learnharness >"$log" 2>&1
+            code=$?
+            set -e
+            if [ "$code" -eq 124 ]; then verdict="ALIVE after 30s"; else verdict="EXITED with $code"; fi
+            if grep -q 'SUID sandbox helper' "$log"; then verdict="$verdict, SUID sandbox FATAL"; fi
+            echo "RESULT $label: $verdict"
+            echo "- **$label**: $verdict (chrome-sandbox $(stat -c '%a' "$SANDBOX"))" >> "$GITHUB_STEP_SUMMARY"
+            echo "--- last 30 log lines:"; tail -30 "$log"
+          }
+          SH
+
+      - name: "A: launch after unpack, before postinst (dpkg --unpack)"
+        run: |
+          source "$RUNNER_TEMP/launch.sh"
+          sudo dpkg --unpack "$DEB"
+          launch A-unpacked-not-configured
+
+      - name: "B: launch after a completed install (dpkg --configure)"
+        run: |
+          source "$RUNNER_TEMP/launch.sh"
+          sudo dpkg --configure learnharness
+          launch B-configured
+
+      - name: "C: completed install, AppArmor profile not loaded"
+        run: |
+          source "$RUNNER_TEMP/launch.sh"
+          sudo apparmor_parser -R /etc/apparmor.d/learnharness
+          launch C-profile-unloaded
+
+      - name: "D: profile not loaded, chrome-sandbox 4755 (suggested fix 2)"
+        run: |
+          source "$RUNNER_TEMP/launch.sh"
+          sudo chmod 4755 "$SANDBOX"
+          launch D-profile-unloaded-4755
+
+      - name: "E: profile loaded again, chrome-sandbox 4755"
+        run: |
+          source "$RUNNER_TEMP/launch.sh"
+          sudo apparmor_parser -r /etc/apparmor.d/learnharness
+          launch E-profile-loaded-4755
